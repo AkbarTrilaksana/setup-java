@@ -1,43 +1,94 @@
-import { JavaBase } from '../base-installer';
-import { JavaDownloadRelease, JavaInstallerOptions, JavaInstallerResults } from '../base-models';
-import semver from 'semver';
-import { extractJdkFile, getDownloadArchiveExtension, isVersionSatisfies } from '../../util';
+import {JavaBase} from '../base-installer.js';
+import {
+  JavaDownloadRelease,
+  JavaInstallerOptions,
+  JavaInstallerResults
+} from '../base-models.js';
+import {
+  cacheJdkDir,
+  extractJdkFile,
+  getDownloadArchiveExtension,
+  renameWinArchive
+} from '../../util.js';
+import * as gpg from '../../gpg.js';
+import {MICROSOFT_PUBLIC_KEY} from './microsoft-key.js';
+import {SIGNATURE_VERIFICATION_FAILURE_HELP} from '../../constants.js';
 import * as core from '@actions/core';
-import { MicrosoftVersion, PlatformOptions } from './models';
 import * as tc from '@actions/tool-cache';
 import fs from 'fs';
 import path from 'path';
+import {TypedResponse} from '@actions/http-client/lib/interfaces';
+
+export {MICROSOFT_PUBLIC_KEY} from './microsoft-key.js';
 
 export class MicrosoftDistributions extends JavaBase {
   constructor(installerOptions: JavaInstallerOptions) {
     super('Microsoft', installerOptions);
   }
 
-  protected async downloadTool(javaRelease: JavaDownloadRelease): Promise<JavaInstallerResults> {
+  protected async downloadTool(
+    javaRelease: JavaDownloadRelease
+  ): Promise<JavaInstallerResults> {
     core.info(
       `Downloading Java ${javaRelease.version} (${this.distribution}) from ${javaRelease.url} ...`
     );
-    const javaArchivePath = await tc.downloadTool(javaRelease.url);
+    let javaArchivePath = await this.downloadAndVerify(javaRelease);
+
+    if (this.verifySignature) {
+      try {
+        if (!javaRelease.signatureUrl) {
+          throw new Error(
+            `Input 'verify-signature' is enabled, but no signature URL was found for Microsoft Build of OpenJDK version ${javaRelease.version}.`
+          );
+        }
+        core.info(`Verifying Java package signature...`);
+        try {
+          await gpg.verifyPackageSignature(
+            javaArchivePath,
+            javaRelease.signatureUrl,
+            this.verifySignaturePublicKey ?? MICROSOFT_PUBLIC_KEY
+          );
+        } catch (error) {
+          throw new Error(
+            `Failed to verify signature for Microsoft Build of OpenJDK version ${javaRelease.version}. Signature URL: ${javaRelease.signatureUrl}. Error: ${(error as Error).message} ${SIGNATURE_VERIFICATION_FAILURE_HELP}`,
+            {cause: error}
+          );
+        }
+      } catch (error) {
+        if (this.verifySignatureExplicitlyRequested) {
+          throw error;
+        }
+        core.warning(
+          error instanceof Error ? error.message : `Unknown error: ${error}`
+        );
+      }
+    }
 
     core.info(`Extracting Java archive...`);
     const extension = getDownloadArchiveExtension();
+    if (process.platform === 'win32') {
+      javaArchivePath = renameWinArchive(javaArchivePath);
+    }
     const extractedJavaPath = await extractJdkFile(javaArchivePath, extension);
 
     const archiveName = fs.readdirSync(extractedJavaPath)[0];
     const archivePath = path.join(extractedJavaPath, archiveName);
 
-    const javaPath = await tc.cacheDir(
+    const javaPath = await cacheJdkDir(
       archivePath,
       this.toolcacheFolderName,
       this.getToolcacheVersionName(javaRelease.version),
       this.architecture
     );
 
-    return { version: javaRelease.version, path: javaPath };
+    return {version: javaRelease.version, path: javaPath};
   }
 
-  protected async findPackageForDownload(range: string): Promise<JavaDownloadRelease> {
-    if (this.architecture !== 'x64' && this.architecture !== 'aarch64') {
+  protected async findPackageForDownload(
+    range: string
+  ): Promise<JavaDownloadRelease> {
+    const arch = this.distributionArchitecture();
+    if (arch !== 'x64' && arch !== 'aarch64') {
       throw new Error(`Unsupported architecture: ${this.architecture}`);
     }
 
@@ -46,85 +97,81 @@ export class MicrosoftDistributions extends JavaBase {
     }
 
     if (this.packageType !== 'jdk') {
-      throw new Error('Microsoft Build of OpenJDK provides only the `jdk` package type');
-    }
-
-    const availableVersionsRaw = await this.getAvailableVersions();
-
-    const opts = this.getPlatformOption();
-    const availableVersions = availableVersionsRaw.map(item => ({
-      url: `https://aka.ms/download-jdk/microsoft-jdk-${item.version.join('.')}-${opts.os}-${
-        this.architecture
-      }.${opts.archive}`,
-      version: this.convertVersionToSemver(item)
-    }));
-
-    const satisfiedVersion = availableVersions
-      .filter(item => isVersionSatisfies(range, item.version))
-      .sort((a, b) => -semver.compareBuild(a.version, b.version))[0];
-
-    if (!satisfiedVersion) {
-      const availableOptions = availableVersions.map(item => item.version).join(', ');
-      const availableOptionsMessage = availableOptions
-        ? `\nAvailable versions: ${availableOptions}`
-        : '';
       throw new Error(
-        `Could not find satisfied version for SemVer ${range}. ${availableOptionsMessage}`
+        'Microsoft Build of OpenJDK provides only the `jdk` package type'
       );
     }
 
-    return satisfiedVersion;
+    const manifest = await this.getAvailableVersions();
+
+    if (!manifest) {
+      throw new Error('Could not load manifest for Microsoft Build of OpenJDK');
+    }
+
+    const foundRelease = await tc.findFromManifest(range, true, manifest, arch);
+
+    if (!foundRelease) {
+      const availableVersionStrings = manifest.map(item => item.version);
+      throw this.createVersionNotFoundError(range, availableVersionStrings);
+    }
+
+    const file = foundRelease.files[0] as {
+      download_url: string;
+      signature_url?: string;
+    };
+    const signatureUrl = file.signature_url ?? `${file.download_url}.sig`;
+
+    return {
+      url: file.download_url,
+      signatureUrl,
+      version: foundRelease.version,
+      checksum: await this.fetchChecksum(
+        `${file.download_url}.sha256sum.txt`,
+        'sha256'
+      )
+    };
   }
 
-  private async getAvailableVersions(): Promise<MicrosoftVersion[]> {
-    // TODO get these dynamically!
-    // We will need Microsoft to add an endpoint where we can query for versions.
-    const jdkVersions = [
-      {
-        version: [17, 0, 3]
-      },
-      {
-        version: [17, 0, 1, 12, 1]
-      },
-      {
-        version: [16, 0, 2, 7, 1]
-      },
-      {
-        version: [11, 0, 15]
+  protected supportsSignatureVerification(): boolean {
+    return true;
+  }
+
+  private async getAvailableVersions(): Promise<tc.IToolRelease[] | null> {
+    let releases: tc.IToolRelease[] | null = null;
+    const fileUrl = `https://aka.ms/download-jdk/microsoft-openjdk-versions.json`;
+
+    // Avoid leaking the GitHub token to a non-GitHub host (aka.ms redirects to a CDN).
+    const headers = {accept: 'application/json'};
+    let response: TypedResponse<tc.IToolRelease[]> | null = null;
+
+    if (core.isDebug()) {
+      console.time('Retrieving available versions for Microsoft took'); // eslint-disable-line no-console
+    }
+
+    try {
+      response = await this.http.getJson<tc.IToolRelease[]>(fileUrl, headers);
+      if (!response.result) {
+        return null;
       }
-    ];
-
-    // M1 is only supported for Java 16 & 17
-    if (process.platform !== 'darwin' || this.architecture !== 'aarch64') {
-      jdkVersions.push({
-        version: [11, 0, 13, 8, 1]
-      });
+    } catch (err) {
+      core.debug(
+        `Http request for microsoft-openjdk-versions.json failed with status code: ${response?.statusCode}. Error: ${err}`
+      );
+      return null;
     }
 
-    return jdkVersions;
-  }
-
-  private getPlatformOption(
-    platform: NodeJS.Platform = process.platform /* for testing */
-  ): PlatformOptions {
-    switch (platform) {
-      case 'darwin':
-        return { archive: 'tar.gz', os: 'macos' };
-      case 'win32':
-        return { archive: 'zip', os: 'windows' };
-      case 'linux':
-        return { archive: 'tar.gz', os: 'linux' };
-      default:
-        throw new Error(
-          `Platform '${platform}' is not supported. Supported platforms: 'darwin', 'linux', 'win32'`
-        );
+    if (response.result) {
+      releases = response.result;
     }
-  }
 
-  private convertVersionToSemver(version: MicrosoftVersion): string {
-    const major = version.version[0];
-    const minor = version.version[1];
-    const patch = version.version[2];
-    return `${major}.${minor}.${patch}`;
+    if (core.isDebug() && releases) {
+      core.startGroup('Print information about available versions');
+      console.timeEnd('Retrieving available versions for Microsoft took'); // eslint-disable-line no-console
+      core.debug(`Available versions: [${releases.length}]`);
+      core.debug(releases.map(item => item.version).join(', '));
+      core.endGroup();
+    }
+
+    return releases;
   }
 }

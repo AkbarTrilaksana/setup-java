@@ -1,46 +1,62 @@
-import { JavaBase } from '../base-installer';
-import { JavaDownloadRelease, JavaInstallerOptions, JavaInstallerResults } from '../base-models';
+import {JavaBase} from '../base-installer.js';
+import {
+  JavaDownloadRelease,
+  JavaInstallerOptions,
+  JavaInstallerResults
+} from '../base-models.js';
 import semver from 'semver';
-import { extractJdkFile, getDownloadArchiveExtension, isVersionSatisfies } from '../../util';
+import {
+  cacheJdkDir,
+  extractJdkFile,
+  getDownloadArchiveExtension,
+  renameWinArchive
+} from '../../util.js';
 import * as core from '@actions/core';
-import { ArchitectureOptions, LibericaVersion, OsVersions } from './models';
-import * as tc from '@actions/tool-cache';
+import {ArchitectureOptions, LibericaVersion, OsVersions} from './models.js';
+import {isAlpineLinux} from '../platform-types.js';
 import fs from 'fs';
 import path from 'path';
 
 const supportedPlatform = `'linux', 'linux-musl', 'macos', 'solaris', 'windows'`;
 
-const supportedArchitecture = `'x86', 'x64', 'armv7', 'aarch64', 'ppc64le'`;
+const supportedArchitectures = `'x86', 'x64', 'armv7', 'aarch64', 'ppc64le'`;
 
 export class LibericaDistributions extends JavaBase {
   constructor(installerOptions: JavaInstallerOptions) {
     super('Liberica', installerOptions);
   }
 
-  protected async downloadTool(javaRelease: JavaDownloadRelease): Promise<JavaInstallerResults> {
+  protected async downloadTool(
+    javaRelease: JavaDownloadRelease
+  ): Promise<JavaInstallerResults> {
     core.info(
       `Downloading Java ${javaRelease.version} (${this.distribution}) from ${javaRelease.url} ...`
     );
-    const javaArchivePath = await tc.downloadTool(javaRelease.url);
+    let javaArchivePath = await this.downloadAndVerify(javaRelease);
 
     core.info(`Extracting Java archive...`);
     const extension = getDownloadArchiveExtension();
+    if (process.platform === 'win32') {
+      javaArchivePath = renameWinArchive(javaArchivePath);
+    }
     const extractedJavaPath = await extractJdkFile(javaArchivePath, extension);
 
     const archiveName = fs.readdirSync(extractedJavaPath)[0];
     const archivePath = path.join(extractedJavaPath, archiveName);
 
-    const javaPath = await tc.cacheDir(
+    const javaPath = await cacheJdkDir(
       archivePath,
       this.toolcacheFolderName,
       this.getToolcacheVersionName(javaRelease.version),
       this.architecture
     );
 
-    return { version: javaRelease.version, path: javaPath };
+    return {version: javaRelease.version, path: javaPath};
   }
 
-  protected async findPackageForDownload(range: string): Promise<JavaDownloadRelease> {
+  protected async findPackageForDownload(
+    range: string
+  ): Promise<JavaDownloadRelease> {
     const availableVersionsRaw = await this.getAvailableVersions();
 
     const availableVersions = availableVersionsRaw.map(item => ({
@@ -49,37 +65,74 @@ export class LibericaDistributions extends JavaBase {
     }));
 
     const satisfiedVersion = availableVersions
-      .filter(item => isVersionSatisfies(range, item.version))
-      .sort((a, b) => -semver.compareBuild(a.version, b.version))[0];
+      .filter(item => this.isVersionSatisfied(range, item.version))
+      .sort((a, b) => -this.compareVersions(a.version, b.version))[0];
 
     if (!satisfiedVersion) {
-      const availableOptions = availableVersions.map(item => item.version).join(', ');
-      const availableOptionsMessage = availableOptions
-        ? `\nAvailable versions: ${availableOptions}`
-        : '';
-      throw new Error(
-        `Could not find satisfied version for semver ${range}. ${availableOptionsMessage}`
+      const availableVersionStrings = availableVersions.map(
+        item => item.version
       );
+      throw this.createVersionNotFoundError(range, availableVersionStrings);
     }
 
     return satisfiedVersion;
   }
 
-  private async getAvailableVersions(): Promise<LibericaVersion[]> {
-    console.time('liberica-retrieve-available-versions');
-    const url = this.prepareAvailableVersionsUrl();
+  protected normalizeVersion(version: string) {
+    const normalized = super.normalizeVersion(version);
+    if (/^\d+\.\d+\.\d+\.\d+(?:-ea)?$/.test(version)) {
+      // Keep patch-only requests distinct from exact SDKMAN build requests.
+      normalized.version = version.replace(/-ea$/, '');
+    }
+    return normalized;
+  }
 
-    if (core.isDebug()) {
-      core.debug(`Gathering available versions from '${url}'`);
+  protected isVersionSatisfied(range: string, version: string): boolean {
+    const patchRequest = range.match(/^(\d+\.\d+\.\d+)\.(\d+)$/);
+    if (patchRequest) {
+      const candidate = semver.parse(version);
+      if (!candidate || !semver.eq(patchRequest[1], candidate)) {
+        return false;
+      }
+      const patch = candidate.build.length > 1 ? candidate.build[0] : '0';
+      return patch === patchRequest[2];
+    }
+    return super.isVersionSatisfied(range, version);
+  }
+
+  protected compareVersions(a: string, b: string): number {
+    const mainComparison = semver.compare(a, b);
+    if (mainComparison !== 0) {
+      return mainComparison;
     }
 
-    const availableVersions = (await this.http.getJson<LibericaVersion[]>(url)).result ?? [];
+    // SDKMAN encodes patch.build, but unpatched releases contain only build.
+    const patchAndBuild = (version: string): string => {
+      const build = new semver.SemVer(version).build;
+      return (build.length > 1 ? build : ['0', ...build]).join('.');
+    };
+    return semver.compareBuild(
+      `0.0.0+${patchAndBuild(a)}`,
+      `0.0.0+${patchAndBuild(b)}`
+    );
+  }
+
+  private async getAvailableVersions(): Promise<LibericaVersion[]> {
+    if (core.isDebug()) {
+      console.time('Retrieving available versions for Liberica took'); // eslint-disable-line no-console
+    }
+    const url = this.prepareAvailableVersionsUrl();
+
+    core.debug(`Gathering available versions from '${url}'`);
+
+    const availableVersions =
+      (await this.http.getJson<LibericaVersion[]>(url)).result ?? [];
 
     if (core.isDebug()) {
       core.startGroup('Print information about available versions');
-      console.timeEnd('liberica-retrieve-available-versions');
-      console.log(`Available versions: [${availableVersions.length}]`);
-      console.log(availableVersions.map(item => item.version));
+      console.timeEnd('Retrieving available versions for Liberica took'); // eslint-disable-line no-console
+      core.debug(`Available versions: [${availableVersions.length}]`);
+      core.debug(availableVersions.map(item => item.version).join(', '));
       core.endGroup();
     }
 
@@ -93,7 +146,8 @@ export class LibericaDistributions extends JavaBase {
       ...this.getArchitectureOptions(),
       'build-type': this.stable ? 'all' : 'ea',
       'installation-type': 'archive',
-      fields: 'downloadUrl,version,featureVersion,interimVersion,updateVersion,buildVersion'
+      fields:
+        'downloadUrl,version,featureVersion,interimVersion,updateVersion,buildVersion'
     };
 
     const searchParams = new URLSearchParams(urlOptions).toString();
@@ -110,25 +164,28 @@ export class LibericaDistributions extends JavaBase {
   }
 
   private getArchitectureOptions(): ArchitectureOptions {
-    switch (this.architecture) {
+    const arch = this.distributionArchitecture();
+    switch (arch) {
       case 'x86':
-        return { bitness: '32', arch: 'x86' };
+        return {bitness: '32', arch: 'x86'};
       case 'x64':
-        return { bitness: '64', arch: 'x86' };
+        return {bitness: '64', arch: 'x86'};
       case 'armv7':
-        return { bitness: '32', arch: 'arm' };
+        return {bitness: '32', arch: 'arm'};
       case 'aarch64':
-        return { bitness: '64', arch: 'arm' };
+        return {bitness: '64', arch: 'arm'};
       case 'ppc64le':
-        return { bitness: '64', arch: 'ppc' };
+        return {bitness: '64', arch: 'ppc'};
       default:
         throw new Error(
-          `Architecture '${this.architecture}' is not supported. Supported architectures: ${supportedArchitecture}`
+          `Architecture '${this.architecture}' is not supported. Supported architectures: ${supportedArchitectures}`
         );
     }
   }
 
-  private getPlatformOption(platform: NodeJS.Platform = process.platform): OsVersions {
+  private getPlatformOption(
+    platform: NodeJS.Platform = process.platform
+  ): OsVersions {
     switch (platform) {
       case 'darwin':
         return 'macos';
@@ -136,7 +193,7 @@ export class LibericaDistributions extends JavaBase {
       case 'cygwin':
         return 'windows';
       case 'linux':
-        return 'linux';
+        return isAlpineLinux(platform) ? 'linux-musl' : 'linux';
       case 'sunos':
         return 'solaris';
       default:
@@ -147,11 +204,28 @@ export class LibericaDistributions extends JavaBase {
   }
 
   private convertVersionToSemver(version: LibericaVersion): string {
-    let { buildVersion, featureVersion, interimVersion, updateVersion } = version;
-    const mainVersion = [featureVersion, interimVersion, updateVersion].join('.');
+    const {featureVersion, interimVersion, updateVersion} = version;
+    const buildVersion = version.version.split('+')[1] || version.buildVersion;
+    const mainVersion = [featureVersion, interimVersion, updateVersion].join(
+      '.'
+    );
+    const patchVersion = version.version.split('+')[0].split('.')[3];
+    if (patchVersion) {
+      return `${mainVersion}+${patchVersion}.${buildVersion}`;
+    }
     if (buildVersion != 0) {
       return `${mainVersion}+${buildVersion}`;
     }
     return mainVersion;
+  }
+
+  protected distributionArchitecture(): string {
+    const arch = super.distributionArchitecture();
+    switch (arch) {
+      case 'arm':
+        return 'armv7';
+      default:
+        return arch;
+    }
   }
 }
